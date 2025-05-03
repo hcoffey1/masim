@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "misc.h"
 #include "masim.h"
@@ -104,6 +105,7 @@ static void init_rndints(void)
  */
 static int rndint(void)
 {
+    return rand();
 	static int rndofs;
 	static int rndarr;
 
@@ -278,8 +280,9 @@ void hint_access_pattern(struct phase *phase)
 	}
 }
 
-void exec_phase(struct phase *phase)
+void * exec_phase(void * arg)
 {
+    struct phase * phase = (struct phase*) arg;
 	struct access *pattern;
 	unsigned long long nr_access;
 	unsigned long long start;
@@ -317,6 +320,8 @@ void exec_phase(struct phase *phase)
 				nr_access /
 				((aclk_clock() - start) / cpu_cycle_ms),
 				((aclk_clock() - start) / cpu_cycle_ms));
+
+    return NULL;
 }
 
 void exec_config(struct access_config *config)
@@ -339,8 +344,23 @@ void exec_config(struct access_config *config)
 		}
 	}
 
+    size_t num_threads = 8;
+
+    pthread_t * thread_ids = calloc(num_threads, sizeof(pthread_t));
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
 	for (i = 0; i < config->nr_phases; i++)
-		exec_phase(&config->phases[i]);
+    {
+        for (int j = 0; j < num_threads; j++)
+        {
+            pthread_create(&thread_ids[j], &attr, &exec_phase, &config->phases[i]);
+        }
+
+        for (int j = 0; j < num_threads; j++)
+            pthread_join(thread_ids[j], NULL);
+    }
 
 	for (i = 0; i < config->nr_regions; i++) {
 		region = &config->regions[i];
