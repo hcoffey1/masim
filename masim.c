@@ -88,7 +88,11 @@ struct access_config {
 
 #define RAND_BATCH	1000
 #define RAND_ARR_SZ	1000
-int rndints[RAND_BATCH][RAND_ARR_SZ];
+size_t rndints[RAND_BATCH][RAND_ARR_SZ];
+
+inline static size_t rand64() {
+	return ((size_t)rand() << 32) | rand();
+}
 
 static void init_rndints(void)
 {
@@ -96,14 +100,14 @@ static void init_rndints(void)
 
 	for (i = 0; i < RAND_BATCH; i++)
 		for (j = 0; j < RAND_ARR_SZ; j++)
-			rndints[i][j] = rand();
+			rndints[i][j] = rand64();
 	rndints[0][0] = 1;
 }
 
 /*
  * Returns a random integer
  */
-static int rndint(void)
+static size_t rndint(void)
 {
     return rand();
 	static int rndofs;
@@ -138,7 +142,7 @@ static void do_seq_ro(struct access *access, int batch)
 
 	for (i = 0; i < batch; i++) {
 		offset += access->stride;
-		if (offset > region->sz)
+		if (offset >= region->sz)
 			offset = 0;
 		read_val = ACCESS_ONCE(rr[offset]);
 	}
@@ -164,7 +168,7 @@ static void do_seq_wo(struct access *access, int batch)
 
 	for (i = 0; i < batch; i++) {
 		offset += access->stride;
-		if (offset > region->sz)
+		if (offset >= region->sz)
 			offset = 0;
 		ACCESS_ONCE(rr[offset]) = 1;
 	}
@@ -197,7 +201,7 @@ static void do_seq_rw(struct access *access, int batch)
 
 	for (i = 0; i < batch; i++) {
 		offset += access->stride;
-		if (offset > region->sz)
+		if (offset >= region->sz)
 			offset = 0;
 		read_val = ACCESS_ONCE(rr[offset]);
 		ACCESS_ONCE(rr[offset]) = read_val + 1;
@@ -300,7 +304,10 @@ void * exec_phase(void * arg)
 		hint_access_pattern(phase);
 
 	while (1) {
-		randn = rndint() % phase->total_probability;
+		if (phase->total_probability)
+			randn = rndint() % phase->total_probability;
+		else
+			randn = -1;
 		for (i = 0; i < phase->nr_patterns; i++) {
 			int prob_start, prob_end;
 
@@ -526,6 +533,7 @@ int parse_phase(char *lines[], int nr_lines, struct phase *p,
 		for (k = 0; k < nr_regions; k++) {
 			if (strcmp(fields[0], regions[k].name) == 0) {
 				a->mregion = &regions[k];
+				break;
 			}
 		}
 		if (a->mregion == NULL)
