@@ -34,10 +34,52 @@ enum hintmethod {
 	MLOCK,
 };
 
+/* can be overriden with --hint */
 enum hintmethod hintmethod = NONE;
+
+/* can be overriden with --quiet */
 int quiet;
+
+/* can be overriden with --default_rw_mode */
 enum rw_mode default_rw_mode = WRITE_ONLY;
+
+/* can be overriden with --repeat */
 int nr_repeats = 1;
+
+/* can be overriden with --log_interval */
+int log_interval_ms = 0;
+
+/*
+ * To minimize random number calculation overhead, we make rand_batch of
+ * rand_arr_sz random number arrays at initialization (init_randints()) and
+ * assign the array of the arrays at rndints.  Read rndint(), the function for
+ * getting a single random number in runtime, to knwo how the pre-initialized
+ * random numbers are really being used.
+ *
+ * Which byte in each region to access under random access mode is determined
+ * by rndint().  If the size of region is very huge compared to total prepared
+ * random numbers in rndints, the program may not access entire bytes of the
+ * region.  User should increase the prepared random numbers in the case.  Or,
+ * this program should handle such case when selecting whych byte to access.
+ *
+ * can be overriden with --random_batch and --random_array
+ */
+static int rand_batch = 1000;
+static int rand_arr_sz = 1000;
+
+/*
+ * To make the overall performance is ruled by not probabilistic region
+ * selections but the memory accesses, we make nr_accesses_per_region accesses
+ * per region, for each of the probabilistic region selection.  Maybe a better
+ * name was nr_accesses_per_region_selection.
+ *
+ * If rand_arr_sz is not big, and the purpose of the program run is not
+ * accurate measurements of the hardware's access speed, this may better to be
+ * low.
+ *
+ * can be overriden with  --nr_accesses_per_region
+ */
+static int nr_accesses_per_region =  1024 * 128;
 
 void pr_regions(struct mregion *regions, size_t nr_regions)
 {
@@ -86,9 +128,7 @@ struct access_config {
 	ssize_t nr_phases;
 };
 
-#define RAND_BATCH	1000
-#define RAND_ARR_SZ	1000
-size_t rndints[RAND_BATCH][RAND_ARR_SZ];
+size_t **rndints;
 
 inline static size_t rand64() {
 	return ((size_t)rand() << 32) | rand();
@@ -98,10 +138,22 @@ static void init_rndints(void)
 {
 	int i, j;
 
-	for (i = 0; i < RAND_BATCH; i++)
-		for (j = 0; j < RAND_ARR_SZ; j++)
+	rndints = malloc(sizeof(rndints) * rand_batch);
+	for (i = 0; i < rand_batch; i++) {
+		rndints[i] = malloc(sizeof(rndints[0]) * rand_arr_sz);
+		for (j = 0; j < rand_arr_sz; j++)
 			rndints[i][j] = rand64();
+	}
 	rndints[0][0] = 1;
+}
+
+static void fini_rndints(void)
+{
+	int i;
+
+	for (i = 0; i < rand_batch; i++)
+		free(rndints[i]);
+	free(rndints);
 }
 
 /*
@@ -113,26 +165,26 @@ static size_t rndint(void)
 	static int rndofs;
 	static int rndarr;
 
-	if (rndofs == RAND_ARR_SZ) {
-		rndarr = rand() % RAND_BATCH;
+	if (rndofs == rand_arr_sz) {
+		rndarr = rand() % rand_batch;
 		rndofs = 0;
 	}
 
 	return rndints[rndarr][rndofs++];
 }
 
-static void do_rnd_ro(struct access *access, int batch)
+static void do_rnd_ro(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
 	int i;
 	char __attribute__((unused)) read_val;
 
-	for (i = 0; i < batch; i++)
+	for (i = 0; i < nr_accesses_per_region; i++)
 		read_val = ACCESS_ONCE(rr[rndint() % region->sz]);
 }
 
-static void do_seq_ro(struct access *access, int batch)
+static void do_seq_ro(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
@@ -140,7 +192,7 @@ static void do_seq_ro(struct access *access, int batch)
 	int i;
 	char __attribute__((unused)) read_val;
 
-	for (i = 0; i < batch; i++) {
+	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
 		if (offset >= region->sz)
 			offset = 0;
@@ -149,24 +201,24 @@ static void do_seq_ro(struct access *access, int batch)
 	access->last_offset = offset;
 }
 
-static void do_rnd_wo(struct access *access, int batch)
+static void do_rnd_wo(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
 	int i;
 
-	for (i = 0; i < batch; i++)
+	for (i = 0; i < nr_accesses_per_region; i++)
 		ACCESS_ONCE(rr[rndint() % region->sz]) = 1;
 }
 
-static void do_seq_wo(struct access *access, int batch)
+static void do_seq_wo(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
 	size_t offset = access->last_offset;
 	int i;
 
-	for (i = 0; i < batch; i++) {
+	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
 		if (offset >= region->sz)
 			offset = 0;
@@ -175,14 +227,14 @@ static void do_seq_wo(struct access *access, int batch)
 	access->last_offset = offset;
 }
 
-static void do_rnd_rw(struct access *access, int batch)
+static void do_rnd_rw(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
 	int i;
 	char read_val;
 
-	for (i = 0; i < batch; i++) {
+	for (i = 0; i < nr_accesses_per_region; i++) {
 		size_t rndoffset;
 
 		rndoffset = rndint() % region->sz;
@@ -191,7 +243,7 @@ static void do_rnd_rw(struct access *access, int batch)
 	}
 }
 
-static void do_seq_rw(struct access *access, int batch)
+static void do_seq_rw(struct access *access)
 {
 	struct mregion *region = access->mregion;
 	char *rr = region->region;
@@ -199,7 +251,7 @@ static void do_seq_rw(struct access *access, int batch)
 	int i;
 	char read_val;
 
-	for (i = 0; i < batch; i++) {
+	for (i = 0; i < nr_accesses_per_region; i++) {
 		offset += access->stride;
 		if (offset >= region->sz)
 			offset = 0;
@@ -211,32 +263,30 @@ static void do_seq_rw(struct access *access, int batch)
 
 static unsigned long long do_access(struct access *access)
 {
-	static const int batch = 1024 * 128;
-
 	switch (access->rw_mode) {
 	case READ_ONLY:
 		if (access->random_access)
-			do_rnd_ro(access, batch);
+			do_rnd_ro(access);
 		else
-			do_seq_ro(access, batch);
+			do_seq_ro(access);
 		break;
 	case WRITE_ONLY:
 		if (access->random_access)
-			do_rnd_wo(access, batch);
+			do_rnd_wo(access);
 		else
-			do_seq_wo(access, batch);
+			do_seq_wo(access);
 		break;
 	case READ_WRITE:
 		if (access->random_access)
-			do_rnd_rw(access, batch);
+			do_rnd_rw(access);
 		else
-			do_seq_rw(access, batch);
+			do_seq_rw(access);
 		break;
 	default:
 		break;
 	}
 
-	return batch;
+	return nr_accesses_per_region;
 }
 
 #define SZ_PAGE	4096
@@ -288,8 +338,8 @@ void * exec_phase(void * arg)
 {
     struct phase * phase = (struct phase*) arg;
 	struct access *pattern;
-	unsigned long long nr_access;
-	unsigned long long start;
+	unsigned long long nr_access, nr_last_logged_access = 0;
+	unsigned long long start, now, last_log_time;
 	int randn;
 	size_t i;
 	static unsigned long long cpu_cycle_ms;
@@ -298,6 +348,7 @@ void * exec_phase(void * arg)
 		cpu_cycle_ms = aclk_freq() / 1000;
 
 	start = aclk_clock();
+	last_log_time = start;
 	nr_access = 0;
 
 	if (hintmethod != NONE)
@@ -318,10 +369,21 @@ void * exec_phase(void * arg)
 				nr_access += do_access(pattern);
 		}
 
-		if (aclk_clock() - start > cpu_cycle_ms * phase->time_ms)
+		now = aclk_clock();
+		if (!quiet && log_interval_ms &&
+				now - last_log_time >
+				cpu_cycle_ms * log_interval_ms) {
+			printf("%s:\t%'20llu accesses / %d msec\n",
+					phase->name,
+					nr_access - nr_last_logged_access,
+					log_interval_ms);
+			last_log_time = now;
+			nr_last_logged_access = nr_access;
+		}
+		if (now - start > cpu_cycle_ms * phase->time_ms)
 			break;
 	}
-	if (!quiet)
+	if (!quiet && !log_interval_ms)
 		printf("%s:\t%'20llu accesses/msec, %llu msecs run\n",
 				phase->name,
 				nr_access /
@@ -331,25 +393,77 @@ void * exec_phase(void * arg)
     return NULL;
 }
 
+static void repeat_data(struct mregion *region, size_t data_filled)
+{
+	size_t to_copy;
+
+	while (data_filled < region->sz) {
+		if (data_filled < region->sz - data_filled)
+			to_copy = data_filled;
+		else
+			to_copy = region->sz - data_filled;
+		memcpy(&region->region[data_filled], region->region, to_copy);
+		data_filled += to_copy;
+	}
+}
+
+static void load_init_data(struct mregion *region)
+{
+	int fd;
+	char buffer[4096];
+	ssize_t bytes_read;
+	size_t data_filled = 0;
+
+	if (!region->data_file)
+		return;
+
+	fd = open(region->data_file, O_RDONLY);
+	if (fd == -1) {
+		perror("init data load, open");
+		exit(1);
+	}
+	while (data_filled < region->sz) {
+		bytes_read = read(fd, buffer, 4096);
+		if (bytes_read == -1) {
+			perror("init data load, read");
+			close(fd);
+			exit(1);
+		} else if (!bytes_read) {
+			break;
+		}
+		if (bytes_read > region->sz - data_filled)
+			bytes_read = region->sz - data_filled;
+		memcpy(&region->region[data_filled], buffer, bytes_read);
+		data_filled += bytes_read;
+	}
+	close(fd);
+	if (data_filled < region->sz)
+		repeat_data(region, data_filled);
+}
+
+static void init_region(struct mregion *region)
+{
+	if (use_hugetlb) {
+		region->region = mmap(HUGETLB_ADDR, region->sz,
+				HUGETLB_PROTECTION, HUGETLB_FLAGS, -1,
+				0);
+		if (region->region == MAP_FAILED) {
+			perror("mmap");
+			exit(1);
+		}
+	} else {
+		region->region = (char *)malloc(region->sz);
+	}
+	load_init_data(region);
+}
+
 void exec_config(struct access_config *config)
 {
 	struct mregion *region;
 	size_t i;
 
-	for (i = 0; i < config->nr_regions; i++) {
-		region = &config->regions[i];
-		if (use_hugetlb) {
-			region->region = mmap(HUGETLB_ADDR, region->sz,
-					HUGETLB_PROTECTION, HUGETLB_FLAGS, -1,
-					0);
-			if (region->region == MAP_FAILED) {
-				perror("mmap");
-				exit(1);
-			}
-		} else {
-			region->region = (char *)malloc(region->sz);
-		}
-	}
+	for (i = 0; i < config->nr_regions; i++)
+		init_region(&config->regions[i]);
 
     size_t num_threads = 8;
 
@@ -372,7 +486,7 @@ void exec_config(struct access_config *config)
 	for (i = 0; i < config->nr_regions; i++) {
 		region = &config->regions[i];
 		if (use_hugetlb)
-			munmap(HUGETLB_ADDR, region->sz);
+			munmap(region->region, region->sz);
 		else
 			free(region->region);
 	}
@@ -408,14 +522,16 @@ void readall(int file, char *buf, ssize_t sz)
 	}
 }
 
-char *rm_comments(char *orig, ssize_t origsz)
+char *rm_comments(char *orig)
 {
 	char *read_cursor;
 	char *write_cursor;
 	size_t len;
 	size_t offset;
 	char *result;
+	size_t origsz;
 
+	origsz = strlen(orig) + 1;
 	result = (char *)malloc(origsz);
 	read_cursor = orig;
 	write_cursor = result;
@@ -466,10 +582,23 @@ size_t parse_regions(char *str, struct mregion **regions_ptr)
 	for (i = 0; i < nr_regions; i++) {
 		r = &regions[i];
 		nr_fields = astr_split(lines[i], ',', &fields);
-		if (nr_fields != 2)
+		if (nr_fields != 2 && nr_fields != 3)
 			err(1, "Wrong format config file: %s", lines[i]);
 		strcpy(r->name, fields[0]);
 		r->sz = atoll(fields[1]);
+		if (nr_fields == 2) {
+			r->data_file = NULL;
+		} else {
+			r->data_file = malloc(sizeof(char) *
+					(strlen(fields[2]) + 1));
+			if (!r->data_file)
+				err(1, "data_file alloc");
+			sscanf(fields[2], "%s", r->data_file);
+			if (!strcmp("none", r->data_file)) {
+				free(r->data_file);
+				r->data_file = NULL;
+			}
+		}
 		astr_free_str_array(fields, nr_fields);
 	}
 
@@ -571,7 +700,7 @@ size_t parse_phases(char *str, struct phase **phases_ptr,
 	nr_phases = 0;
 	nr_lines = astr_split(str, '\n', &lines_orig);
 	lines = lines_orig;
-	if (nr_lines < 4)	/* phase name, time, nr patterns, pattern */
+	if (nr_lines < 3)	/* phase name, time, pattern */
 		err(1, "Not enough lines for phases %s", str);
 
 	for (i = 0; i < nr_lines; i++) {
@@ -621,7 +750,7 @@ void read_config(char *cfgpath, struct access_config *config_ptr)
 	readall(f, cfgstr, sb.st_size);
 	close(f);
 
-	content = rm_comments(cfgstr, sb.st_size);
+	content = rm_comments(cfgstr);
 	free(cfgstr);
 
 	len_paragraph = paragraph_len(content, strlen(content));
@@ -705,6 +834,39 @@ static struct argp_option options[] = {
 		.doc = "repeat the run <count> times",
 		.group = 0,
 	},
+	{
+		.name = "log_interval",
+		.key = 1,
+		.arg = "<milliseconds>",
+		.flags = 0,
+		.doc = "periodic access speed logging interval",
+		.group = 0,
+	},
+	{
+		.name = "random_batch",
+		.key = 2,
+		.arg = "<int>",
+		.flags = 0,
+		.doc = "number of random number arrays",
+		.group = 0,
+	},
+	{
+		.name = "random_array",
+		.key = 3,
+		.arg = "<int>",
+		.flags = 0,
+		.doc = "size of each random number array",
+		.group = 0,
+	},
+	{
+		.name = "nr_accesses_per_region",
+		.key = 4,
+		.arg = "<int>",
+		.flags = 0,
+		.doc = "number of acceses to do per selected region",
+		.group = 0,
+	},
+
 	{}
 };
 
@@ -761,6 +923,18 @@ error_t parse_option(int key, char *arg, struct argp_state *state)
 	case 'h':
 		use_hugetlb = 1;
 		break;
+	case 1:
+		log_interval_ms = atoi(arg);
+		break;
+	case 2:
+		rand_batch = atoi(arg);
+		break;
+	case 3:
+		rand_arr_sz = atoi(arg);
+		break;
+	case 4:
+		nr_accesses_per_region = atoi(arg);
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -796,6 +970,7 @@ int main(int argc, char *argv[])
 
 		init_rndints();
 		exec_config(&config);
+		fini_rndints();
 	}
 
 	return 0;
