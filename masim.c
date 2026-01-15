@@ -109,14 +109,18 @@ static void init_rndints(void)
  */
 static size_t rndint(void)
 {
-    return rand();
-	static int rndofs;
-	static int rndarr;
+	static __thread int rndofs;
+	static __thread int rndarr;
+	static __thread unsigned int rnd_seed;
 
-	if (rndofs == RAND_ARR_SZ) {
-		rndarr = rand() % RAND_BATCH;
+	if (rnd_seed == 0)
+		rnd_seed = (unsigned int)(time(NULL) ^ (uintptr_t)&rnd_seed);
+
+	if (rndofs == RAND_ARR_SZ)
 		rndofs = 0;
-	}
+
+	if (rndofs == 0)
+		rndarr = rand_r(&rnd_seed) % RAND_BATCH;
 
 	return rndints[rndarr][rndofs++];
 }
@@ -351,23 +355,31 @@ void exec_config(struct access_config *config)
 		}
 	}
 
-    size_t num_threads = 8;
+	size_t num_threads = 8;
+	const char *threads_env = getenv("MASIM_THREADS");
 
-    pthread_t * thread_ids = calloc(num_threads, sizeof(pthread_t));
+	if (threads_env) {
+		long parsed = strtol(threads_env, NULL, 10);
+		if (parsed > 0)
+			num_threads = parsed;
+	} else {
+		long online = sysconf(_SC_NPROCESSORS_ONLN);
+		if (online > 0)
+			num_threads = online;
+	}
 
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
+	pthread_t *thread_ids = calloc(num_threads, sizeof(pthread_t));
 
-	for (i = 0; i < config->nr_phases; i++)
-    {
-        for (int j = 0; j < num_threads; j++)
-        {
-            pthread_create(&thread_ids[j], &attr, &exec_phase, &config->phases[i]);
-        }
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
 
-        for (int j = 0; j < num_threads; j++)
-            pthread_join(thread_ids[j], NULL);
-    }
+	for (i = 0; i < config->nr_phases; i++) {
+		for (int j = 0; j < num_threads; j++)
+			pthread_create(&thread_ids[j], &attr, &exec_phase, &config->phases[i]);
+
+		for (int j = 0; j < num_threads; j++)
+			pthread_join(thread_ids[j], NULL);
+	}
 
 	for (i = 0; i < config->nr_regions; i++) {
 		region = &config->regions[i];
