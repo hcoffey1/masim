@@ -168,11 +168,11 @@ static size_t rndint(void)
 	if (rnd_seed == 0)
 		rnd_seed = (unsigned int)(time(NULL) ^ (uintptr_t)&rnd_seed);
 
-	if (rndofs == RAND_ARR_SZ)
+	if (rndofs == rand_arr_sz)
 		rndofs = 0;
 
 	if (rndofs == 0)
-		rndarr = rand_r(&rnd_seed) % RAND_BATCH;
+		rndarr = rand_r(&rnd_seed) % rand_batch;
 
 	return rndints[rndarr][rndofs++];
 }
